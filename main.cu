@@ -1,166 +1,217 @@
-#include <chrono>
-#include <cmath>
-#include <cub/cub.cuh>
-#include <cuda_runtime.h>
 #include <iostream>
-#include <stdlib.h>
+#include <cmath>
 
-using namespace std;
-using namespace cub;
+#include <cuda_runtime.h>
+#include <cuda.h> 
+#include <cub/cub.cuh>
+#include <cub/block/block_reduce.cuh>
+//#include "sub.cuh" 
+#include <chrono>
 
-// функция, обновляющая значения сетки
-__global__ void update(double *A, double *Anew, int size) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
-  int i = blockIdx.y * blockDim.y + threadIdx.y;
-  if (j < size - 1 && j > 0 && i > 0 && i < size - 1) {
-    double left = A[i * size + j - 1];
-    double right = A[i * size + j + 1];
-    double top = A[(i - 1) * size + j];
-    double bottom = A[(i + 1) * size + j];
-    Anew[i * size + j] = 0.25 * (left + right + top + bottom);
-  }
+
+// поддержка double
+#define LF_SUP
+
+#ifdef LF_SUP
+#define TYPE double
+#define ABS fabs
+#define MAX fmax
+#define CAST std::stod
+#else
+#define TYPE floatпш
+#define ABS fabsf
+#define MAX fmaxf
+#define CAST std::stof
+#endif
+
+//индексация по фортрану
+#define IDX2C(i, j, ld) (((j)*(ld))+(i))
+
+
+// функция инициализации сетки
+void initArr(TYPE *A, int n)
+{
+    //заполнение углов сетки
+    A[IDX2C(0, 0, n)] = 10.0;
+    A[IDX2C(0, n - 1, n)] = 20.0;
+    A[IDX2C(n - 1, 0, n)] = 20.0;
+    A[IDX2C(n - 1, n - 1, n)] = 30.0;
+
+
+    //заполнение краёв сетки
+    for (int i{1}; i < n - 1; ++i)
+    {
+        A[IDX2C(0,i,n)] = 10 + (i * 10.0 / (n - 1));
+        A[IDX2C(i,0,n)] = 10 + (i * 10.0 / (n - 1));
+        A[IDX2C(n-1,i,n)] = 20 + (i * 10.0 / (n - 1));
+        A[IDX2C(i,n-1,n)] = 20 + (i * 10.0 / (n - 1));
+    }
+  
 }
 
-// функция нахождения разности двух массивов
-__global__ void substract(double *A, double *Anew, double *res, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int j = blockIdx.y * blockDim.y + threadIdx.y;
-  if (i >= 0 && i < size && j >= 0 && j < size)
-    res[i * size + j] = Anew[i * size + j] - A[i * size + j];
+//функция печати массива на гпу
+ void printArr(TYPE *A, int n)
+{
+    for (int i {0}; i < n; ++i)
+    {
+        for (int j {0}; j < n; ++j)
+        {
+
+            printf("%lf ", A[IDX2C(i,j,n)]);
+        }
+        std::cout<<std::endl;
+    }
+    
 }
 
-__constant__ double add;
 
-// функция для заполнения массивов
-__global__ void fill(double *A, double *Anew, int size) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (i < size) {
-    A[i * (size) + 0] = 10 + add * i;
-    A[i] = 10 + add * i;
-    A[(size - 1) * (size) + i] = 20 + add * i;
-    A[i * (size) + size - 1] = 20 + add * i;
-
-    Anew[i * (size) + 0] = A[i * (size) + 0];
-    Anew[i] = A[i];
-    Anew[(size - 1) * (size) + i] = A[(size - 1) * (size) + i];
-    Anew[i * (size) + size - 1] = A[i * (size) + size - 1];
-  }
+// Шаг алгоритма
+__global__ void Step(const double* A, double* Anew, int* dev_n){
+    //вычисление ячейки
+    unsigned int j = blockIdx.x * blockDim.x + threadIdx.x; 
+    unsigned int i = blockIdx.y * blockDim.y + threadIdx.y;
+    //проверка границ
+    if (j == 0 || i == 0 || i == *dev_n-1 || j == *dev_n-1) return;
+    //среднее по соседним элементам
+    Anew[IDX2C(j, i, *dev_n)] = 0.25 * (A[IDX2C(j, i+1, *dev_n)] + A[IDX2C(j, i-1, *dev_n)] + A[IDX2C(j-1, i, *dev_n)] + A[IDX2C(j+1, i, *dev_n)]);
 }
 
-// основное тело программы
-int main(int argc, char *argv[]) {
-  // время до выполнения программы
-  auto begin = std::chrono::steady_clock::now();
 
-  // выбираем устрйоство для исполнения
-  cudaSetDevice(1);
+__global__ void reduceBlock(const double *A, const double *Anew, const int n, double *out){
+    // создание блока
+    typedef cub::BlockReduce<double, 256> BlockReduce; 
+    __shared__ typename BlockReduce::TempStorage temp_storage;
 
-  // инициализация переменных
-  double tol = atof(argv[1]);
-  const int size = atoi(argv[2]), iter_max = atoi(argv[3]);
+    double error = 0;
+    // проходим по массивам и находим макс разницу
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x){
+        error = MAX(error, ABS(Anew[i] - A[i]));
+    }
+    // засовываем максимальную разницу в блок редукции
+    double block_max_diff = BlockReduce(temp_storage).Reduce(error, cub::Max());
 
-  double *d_A = NULL, *d_Anew = NULL, *d_Asub;
-  cudaError_t cudaerr = cudaSuccess;
+    // обновление значения
+    if (threadIdx.x == 0){
+        out[blockIdx.x] = block_max_diff; 
+    }
+}
 
-  // выделение памяти под массивы и проверка на наличие ошибок
-  cudaerr = cudaMalloc((void **)&d_A, sizeof(double) * size * size);
-  if (cudaerr != cudaSuccess) {
-    fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n",
-            cudaGetErrorString(cudaerr));
-    exit(EXIT_FAILURE);
-  }
 
-  cudaerr = cudaMalloc((void **)&d_Anew, sizeof(double) * size * size);
-  if (cudaerr != cudaSuccess) {
-    fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n",
-            cudaGetErrorString(cudaerr));
-    exit(EXIT_FAILURE);
-  }
 
-  cudaerr = cudaMalloc((void **)&d_Asub, sizeof(double) * size * size);
-  if (cudaerr != cudaSuccess) {
-    fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n",
-            cudaGetErrorString(cudaerr));
-    exit(EXIT_FAILURE);
-  }
+//основной цикл программы
+void solution(TYPE tol, int iter_max, int n)
+{
+    //acc_set_device_num(3,acc_device_default);
 
-  // инициализация переменных
-  int iter = 0;
-  double error = 1;
-  double addH = 10.0 / (size - 1);
-  cudaMemcpyToSymbol(add, &addH, sizeof(double));
 
-  dim3 threadPerBlock = dim3(32, 32);
-  dim3 blocksPerGrid = dim3((size + threadPerBlock.x - 1) / threadPerBlock.x,
-                            (size + threadPerBlock.y - 1) / threadPerBlock.y);
 
-  // заполняем сетки
-  fill<<<blocksPerGrid, threadPerBlock>>>(d_A, d_Anew, size);
+    //текущая ошибка, счетчик итераций, размер(площадь) сетки
+    TYPE error{1.0};
+    int iter{0},size{n*n}; 
+    
 
-  // инициализация ошибки, редукции, потока и графа
-  double *d_error;
-  cudaMalloc(&d_error, sizeof(double));
+    //alpha - скаляр для вычитания
+    //inc - шаг инкремента
+    //max_idx - индекс максимального элемента
+    TYPE alpha {-1};
+    int inc {1}, max_idx { 0};
 
-  // определяем требования к временному хранилищу устройства
-  void *d_temp_storage =
-      NULL; // доступное для устройства выделение временного хранилища
-  size_t temp_storage_bytes = 0; // размер выделяемой памяти для d_temp_storage
-  cub::DeviceReduce::Max(
-      d_temp_storage, temp_storage_bytes, d_A, d_error,
-      size * size); // предоставление количества байтов, необходимых для
-                    // временного хранения, необходимого CUB
-  // выделяем временное хранилище
-  cudaMalloc(&d_temp_storage, temp_storage_bytes);
+    //матрицы
+    TYPE *A = new TYPE [size], *Anew = new TYPE [size], *Atmp = new TYPE [size];
+    
+    bool flag {true}; // флаг для обновления значения ошибки на хосте
 
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
+    //инициализация сеток
+    initArr(A, n);
+    initArr(Anew, n);
 
-  bool graphCreated = false;
-  cudaGraph_t graph;
-  cudaGraphExec_t instance;
+    //указатели на массивы, которые будут лежать на девайсе
+    double *dev_A, *dev_Anew, *dev_Atmp;
 
-  // цикл пересчета ошибки и обновления сетки
-  while ((error > tol) && (iter < iter_max / 2 / 100)) {
-    iter = iter + 1;
+    //выделение памяти на видеокарте под массивы
+    cudaMalloc(&dev_A,size*sizeof(TYPE));
+    cudaMalloc(&dev_Anew,size*sizeof(TYPE));
+    //cudaMalloc(&dev_Atmp,size*sizeof(TYPE));
 
-    // если граф не создан, то создаем с помощью захвата цикла for
-    if (!graphCreated) {
-      cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
 
-      //обновление значений сетки (почему два раза - подробно описано в отчете)
-      for (int i = 0; i < 100; i++) {
-        update<<<blocksPerGrid, threadPerBlock, 0, stream>>>(d_Anew, d_A, size);
-        update<<<blocksPerGrid, threadPerBlock, 0, stream>>>(d_A, d_Anew, size);
-      }
-      cudaStreamEndCapture(stream, &graph);
-      cudaGraphInstantiate(&instance, graph, NULL, NULL, 0);
-      graphCreated = true;
+    //копирование массивов на видеокарту 
+    cudaMemcpy(dev_A, A, size, cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_Anew, Anew, size, cudaMemcpyHostToDevice);
+
+    //определение количество потоков на блок
+    dim3 threadPerBlock = dim3(32,32); 
+    //определение количество блоков на сетку
+    dim3 blocksPerGrid = dim3((n + 31) / 32, (n+31)/32);
+
+    //printArr(A,n);
+    //std::cout<<"___________________________"<<std::endl;
+    
+    while (error > tol && iter < iter_max)
+    {
+        flag = !(iter % n);
+
+        // меняем местами, чтобы не делать swap с доп переменной. работает быстрее
+        Step<<<blocksPerGrid, threadPerBlock>>>(A, Anew, n_d); 
+        Step<<<blocksPerGrid, threadPerBlock>>>(Anew, A, n_d); 
+
+        if(flag){
+            //reduceBlock<<<num_blocks_reduce, THREADS_PER_BLOCK_REDUCE>>>(F, Fnew, size, error_reduction); // по блочно проходим редукцией
+            //cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, error_reduction, error, num_blocks_reduce); // проходим редукцией по всем блокам
+            ////обновление ошибки на хосте 
+            //cudaMemcpy(tmp_err, error, sizeof(double), cudaMemcpyDeviceToHost);
+            
+        }
+        ++iter;   
     }
 
-    // запускаем граф
-    cudaGraphLaunch(instance, stream);
 
-    // вычитаем один массив из другого
-    substract<<<blocksPerGrid, threadPerBlock, 0, stream>>>(d_A, d_Anew, d_Asub,
-                                                            size);
+    std::cout << "Iterations: " << iter << std::endl<< "Error: " << error << std::endl;
+    
+    cudaFree(dev_A);
+    cudaFree(dev_Anew);
+    //cudaFree(dev_Atmp);
 
-    // находим новое значение ошибки
-    cub::DeviceReduce::Max(d_temp_storage, temp_storage_bytes, d_Asub, d_error,
-                           size * size, stream);
-    cudaMemcpy(&error, d_error, sizeof(double), cudaMemcpyDeviceToHost);
-    std::cout << iter << ":" << error << "\n";
-  }
+    delete[] A;
+    delete[] Anew;
+    delete[] Atmp;
+}
 
-  // освобождаем память
-  cudaFree(d_A);
-  cudaFree(d_Anew);
-  cudaFree(d_error);
+int main(int argc, char *argv[])
+{
+    
+    TYPE tol{1e-6};
+    int iter_max{1000000}, n{128}; // значения для отладки, по умолчанию инициализировать нулями
 
-  // считаем и выводим затраченное время с помощью std::chrono
-  auto end = std::chrono::steady_clock::now();
-  auto elapsed_ms =
-      std::chrono::duration_cast<std::chrono::milliseconds>(end - begin);
-  std::cout << "The time:" << elapsed_ms.count() << "ms\n";
-  return 0;
+    //парсинг командной строки
+    std::string tmpStr;
+    //-t - точность
+    //-n - размер сетки
+    //-i - кол-во итераций
+    for (int i{1}; i < argc; ++i)
+    {
+        tmpStr = argv[i];
+        if (!tmpStr.compare("-t"))
+        {
+            tol = CAST(argv[i + 1]);
+            ++i;
+        }
+
+        if (!tmpStr.compare("-i"))
+        {
+            iter_max = std::stoi(argv[i + 1]);
+            ++i;
+        }
+
+        if (!tmpStr.compare("-n"))
+        {
+            n = std::stoi(argv[i + 1]);
+            ++i;
+        }
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    solution(tol,iter_max,n);
+    auto end = std::chrono::high_resolution_clock::now() - start;
+    long long microseconds = std::chrono::duration_cast<std::chrono::microseconds>(end).count();
+    std::cout<<"Time (ms): "<<microseconds/1000<<std::endl;
 }
